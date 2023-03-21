@@ -1390,7 +1390,7 @@ static inline int post_pageout_rls_pages(
 			count_vm_event(PGLAZYFREED);
 			count_memcg_page_event(page, PGLAZYFREED);
 		
-		} else if (!mapping || !_remove_mapping(mapping, page, true, lruvec,
+		} else if (!mapping || !__remove_mapping(mapping, page, true, lruvec,
 					memcgid, &batch_uncharge_cnt)) {
 			goto keep_locked;
 		}
@@ -1532,7 +1532,7 @@ batched_pageout(struct list_head *page_list, struct list_head *clean_pages,
 				goto keep_locked;
 			}
 
-			switch (pageout_profiling(page, mapping, false, core,
+			switch (pageout_profiling(page, mapping, core,
 						  pf_breakdown)) {
 			case PAGE_KEEP:
 				// pr_err("YIFAN: %s:%d", __func__, __LINE__);
@@ -1592,7 +1592,7 @@ keep:
 		list_add(&page->lru, ret_pages);
 		VM_BUG_ON_PAGE(PageLRU(page) || PageUnevictable(page), page);
 	}
-	pf_ts = pf_cycles_end();
+	pf_ts = get_cycles_end();
 	// shengkai : TODO add tag
 	// adc_pf_breakdown_end(pf_breakdown, ADC_BATCHING_OUT, pf_ts);
 
@@ -1600,7 +1600,7 @@ keep:
 	nr_reclaimed += post_pageout_rls_pages(clean_pages, free_pages,
 						      ret_pages, pgdat, sc, stat,
 							  pf_breakdown);
-	pf_ts = pf_cycles_end();
+	pf_ts = get_cycles_end();
 	adc_pf_breakdown_end(pf_breakdown, ADC_RLS_PG_RM_MAP, pf_ts);
 	if (list_empty(&under_write_pages)) {// not empty means error
 		goto done;
@@ -1613,17 +1613,17 @@ keep:
 		list_splice_tail(&under_write_pages, ret_pages);
 
 		// adc_pf_breakdown_end(pf_breakdown, ADC_POLL_STORE,
-		// 		     pf_cycles_end());
+		// 		     get_cycles_end());
 		goto done;
 	}
-	pf_ts = pf_cycles_end();
+	pf_ts = get_cycles_end();
 	// adc_pf_breakdown_end(pf_breakdown, ADC_POLL_STORE, pf_ts);
 	adc_pf_breakdown_stt(pf_breakdown, ADC_RLS_PG_RM_MAP, pf_ts);
 	nr_reclaimed +=
 		post_pageout_rls_pages(&under_write_pages, free_pages,
 					      ret_pages, pgdat, sc, stat,
 					      pf_breakdown);
-	pf_ts = pf_cycles_end();
+	pf_ts = get_cycles_end();
 	adc_pf_breakdown_end(pf_breakdown, ADC_RLS_PG_RM_MAP, pf_ts);
 
 done:
