@@ -406,7 +406,7 @@ int __frontswap_load_async(struct page *page, u64 vaddr,struct vm_area_struct *v
 
 	/* Try loading from each implementation, until one succeeds. */
 	for_each_frontswap_ops(ops) {
-		ret = ops->load_async(offset, page, vaddr, vma,ptep, orig_pte);
+		ret = ops->load_async(offset, page, vaddr, vma, ptep, orig_pte);
 		if (!ret) /* successful load */
 			break;
 	}

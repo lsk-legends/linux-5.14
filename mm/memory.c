@@ -3585,8 +3585,7 @@ vm_fault_t do_swap_page_map_pte_profiling(struct vm_fault *vmf, int *adc_pf_bits
 		if (!locked) {
 			ret |= VM_FAULT_RETRY;
 			adc_pf_breakdown_end(pf_breakdown, ADC_UPD_METADATA,
-					     pf_cycles_end());
-			adc_pf_breakdown_end(pf_breakdown, ADC_WAIT_PAGE_LOCK, pf_cycles_end());
+					     get_cycles_end());
 			goto out_release;
 		}
 	}
@@ -3705,7 +3704,7 @@ vm_fault_t do_swap_page_map_pte_profiling(struct vm_fault *vmf, int *adc_pf_bits
 		unlock_page(swapcache);
 		put_page(swapcache);
 	}
-	adc_pf_breakdown_end(pf_breakdown, ADC_SETPTE, pf_cycles_end());
+	adc_pf_breakdown_end(pf_breakdown, ADC_SETPTE, get_cycles_end());
 
 	if (vmf->flags & FAULT_FLAG_WRITE) {
 		ret |= do_wp_page(vmf);
@@ -3928,7 +3927,7 @@ vm_fault_t do_swap_page_profiling(struct vm_fault *vmf, int *adc_pf_bits,
 		frontswap_poll_load(cpu);
 		cpu = -1;
 		// adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO,
-		// 				pf_cycles_end());
+		// 				get_cycles_end());
 	}
 
 	/*

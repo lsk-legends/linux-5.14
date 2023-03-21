@@ -979,7 +979,7 @@ skip:
 inline static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
 				       struct vm_fault *vmf)
 {
-	int cpu
+	int cpu;
 	return swap_vma_readahead_profiling(fentry, gfp_mask, vmf, NULL, NULL, &cpu);
 }
 
@@ -1057,7 +1057,7 @@ vm_fault_t swapin_bypass_swapcache(struct page **pagep,
 
 	if (!page) {
 		// adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO,
-		// 		     pf_cycles_end());
+		// 		     get_cycles_end());
 		goto oom;
 	}
 
@@ -1096,7 +1096,8 @@ vm_fault_t swapin_bypass_swapcache(struct page **pagep,
 		goto done;
 
 	fcpu = *cpu;
-	for (int i = 0, pte = &ra_info->ptes[i]; i < ra_info->nr_pte;
+	int i;
+	for (i = 0, pte = ra_info->ptes; i < ra_info->nr_pte;
 	     i++, pte++) {
 		//end prefetch when load sync done
 		if (fcpu != -1 && frontswap_peek_load(fcpu) == 0)
@@ -1134,12 +1135,12 @@ vm_fault_t swapin_bypass_swapcache(struct page **pagep,
 	}
 
 done:
-	adc_pf_breakdown_end(pf_breakdown, ADC_PREFETCH, pf_cycles_end());
+	adc_pf_breakdown_end(pf_breakdown, ADC_PREFETCH, get_cycles_end());
 	lru_cache_add(page);
 	return 0;
 oom:
 	//lazy poll can't get specific io time
-	// adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO, pf_cycles_end());
+	// adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO, get_cycles_end());
 	return VM_FAULT_OOM;
 }
 

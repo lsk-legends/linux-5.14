@@ -1973,8 +1973,8 @@ static int unuse_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 			};
 			//shengkai : make sure call fuction right
 			int cpu;
-			page = swapin_readahead_profiling(entry, GFP_HIGHUSER_MOVABLE,
-						&vmf, &cpu);
+			page = swapin_readahead(entry, GFP_HIGHUSER_MOVABLE,
+						&vmf);
 			// printk("[ERROR] : Using swapin_readahead!\n");
 		}
 		if (!page) {

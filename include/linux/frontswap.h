@@ -20,7 +20,7 @@ struct frontswap_ops {
 	int (*store_on_core)(unsigned, pgoff_t, struct page *, int); /* store a page with specific core*/
 	int (*poll_store)(int); /* poll cpu for store */
 	int (*load)(unsigned, pgoff_t, struct page *); /* load a page */
-	int (*load_async)(unsigned, pgoff_t, struct page *); /* async load a page */
+	int (*load_async)(pgoff_t, struct page *, u64, struct vm_area_struct*, pte_t*, pte_t); /* async load a page */
 	int (*poll_load)(int); /* poll cpu for one load */
 	int (*peek_load)(int); /* peek cpu for sync load */
 	void (*invalidate_page)(unsigned, pgoff_t); /* page no longer needed */
