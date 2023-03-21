@@ -37,6 +37,8 @@ void page_writeback_init(void);
 vm_fault_t do_swap_page(struct vm_fault *vmf);
 vm_fault_t do_swap_page_profiling(struct vm_fault *vmf, int *adc_pf_bits,
 				  uint64_t pf_breakdown[]);
+vm_fault_t do_swap_page_map_pte_profiling(struct vm_fault *vmf, int *adc_pf_bits,
+				  uint64_t pf_breakdown[]);
 
 void free_pgtables(struct mmu_gather *tlb, struct vm_area_struct *start_vma,
 		unsigned long floor, unsigned long ceiling);

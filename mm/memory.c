@@ -3472,6 +3472,406 @@ static vm_fault_t remove_device_exclusive_entry(struct vm_fault *vmf)
 	return 0;
 }
 
+/* shengkai:
+ * swapin_map_pte - try map pages prefetched, called by rswap callback func
+ * 
+ * changed from do_swap_page(),how to do link? 
+ * use utils to make rswap refer to swapin_map_pte?
+ * 
+*/
+vm_fault_t do_swap_page_map_pte_profiling(struct vm_fault *vmf, int *adc_pf_bits,
+				  uint64_t pf_breakdown[])
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct page *page = NULL, *swapcache;
+	struct swap_info_struct *si = NULL;
+	swp_entry_t entry;
+	pte_t pte;
+	int locked;
+	int exclusive = 0;
+	vm_fault_t ret = 0;
+	// [RMGrid] profiling
+	uint64_t pf_ts;
+	/* [Hermit] */
+	// struct ds_area_struct *dsa = NULL;
+	int cpu = -1;
+	spinlock_t *ptl = NULL;
+	// unsigned long old_pte_val;
+
+	if (!pte_unmap_same(vma->vm_mm, vmf->pmd, vmf->pte, vmf->orig_pte))
+		goto out_profiling;
+
+	entry = pte_to_swp_entry(vmf->orig_pte);
+	if (unlikely(non_swap_entry(entry))) {
+		if (is_migration_entry(entry)) {
+			migration_entry_wait(vma->vm_mm, vmf->pmd,
+					     vmf->address);
+		} else if (is_device_exclusive_entry(entry)) {
+			vmf->page = pfn_swap_entry_to_page(entry);
+			ret = remove_device_exclusive_entry(vmf);
+		} else if (is_device_private_entry(entry)) {
+			vmf->page = pfn_swap_entry_to_page(entry);
+			ret = vmf->page->pgmap->ops->migrate_to_ram(vmf);
+		} else if (is_hwpoison_entry(entry)) {
+			ret = VM_FAULT_HWPOISON;
+		} else {
+			print_bad_pte(vma, vmf->address, vmf->orig_pte, NULL);
+			ret = VM_FAULT_SIGBUS;
+		}
+		goto out_profiling;
+	}
+
+	/* Prevent swapoff from happening to us. */
+	si = get_swap_device(entry);
+	if (unlikely(!si))
+		goto out_profiling;
+
+	pf_ts = get_cycles_end();
+	adc_pf_breakdown_end(pf_breakdown, ADC_LOCK_GET_PTE, pf_ts);
+	adc_pf_breakdown_stt(pf_breakdown, ADC_LOOKUP_SWAPCACHE, pf_ts);
+
+	set_adc_pf_bits(adc_pf_bits, ADC_PF_SWAP_BIT);
+	delayacct_set_flag(current, DELAYACCT_PF_SWAPIN);
+	page = lookup_swap_cache(entry, vma, vmf->address);
+	swapcache = page;
+
+	pf_ts = get_cycles_end();
+	adc_pf_breakdown_end(pf_breakdown, ADC_LOOKUP_SWAPCACHE, pf_ts);
+
+	// shengkai:
+	// should not happen in this fuction 
+	if(!page || page != vmf->page){
+		// pr_err("%s: fault map pte\n", __func__);
+		ret = VM_FAULT_SIGBUS;
+		// shengkai:TODO
+		// adc_profile_counter_inc(ADC_PREF_NOT_MATCH);
+		goto out;
+	}
+
+	// [RMGrid] profile swap cache hits
+	if (page) { // Hit on swap cache (include ondemand pages and prefetched pages)
+		if (test_and_clear_page_prefetch(page)) { // Make sure to count only once
+			// Hit on swap cache (only prefetched pages)
+			adc_profile_counter_inc(ADC_HIT_ON_PREFETCH);
+			if (vma->vm_mm)
+				count_memcg_event_mm(vma->vm_mm,
+						     HITON_SWAP_CACHE);
+		}
+	}
+
+	if (PageHWPoison(page)) {
+		/*
+		 * hwpoisoned dirty swapcache pages are kept for killing
+		 * owner processes (which may be unknown at hwpoison time)
+		 */
+		ret = VM_FAULT_HWPOISON;
+		delayacct_clear_flag(current, DELAYACCT_PF_SWAPIN);
+		adc_pf_breakdown_stt(pf_breakdown, ADC_SET_PAGEMAP_UNLOCK,
+				     get_cycles_end());
+		goto out_release;
+	}
+
+	pf_ts = pf_cycles_start();
+	adc_pf_breakdown_stt(pf_breakdown, ADC_SET_PAGEMAP_UNLOCK,
+			     pf_ts);
+	adc_pf_breakdown_stt(pf_breakdown, ADC_UPD_METADATA,
+			     pf_ts);
+
+	if (cpu == -1) {// shengkai: demand paging always use page new alloced, don't need to lock page
+		locked = trylock_page(page);
+		// locked = lock_page_or_retry(page, vma->vm_mm, vmf->flags);
+
+		delayacct_clear_flag(current, DELAYACCT_PF_SWAPIN);
+		if (!locked) {
+			ret |= VM_FAULT_RETRY;
+			adc_pf_breakdown_end(pf_breakdown, ADC_UPD_METADATA,
+					     pf_cycles_end());
+			adc_pf_breakdown_end(pf_breakdown, ADC_WAIT_PAGE_LOCK, pf_cycles_end());
+			goto out_release;
+		}
+	}
+
+	/*
+	 * Make sure try_to_free_swap or reuse_swap_page or swapoff did not
+	 * release the swapcache from under us.  The page pin, and pte_same
+	 * test below, are not enough to exclude that.  Even if it is still
+	 * swapcache, we need to check that the page's swap has not changed.
+	 */
+	if (unlikely((!PageSwapCache(page) ||
+			page_private(page) != entry.val)) && swapcache) {
+		adc_pf_breakdown_end(pf_breakdown, ADC_UPD_METADATA,
+				     get_cycles_end());
+		goto out_page;
+	}
+
+	page = ksm_might_need_to_copy(page, vma, vmf->address);
+	if (unlikely(!page)) {
+		ret = VM_FAULT_OOM;
+		page = swapcache;
+		adc_pf_breakdown_end(pf_breakdown, ADC_UPD_METADATA,
+				     get_cycles_end());
+		goto out_page;
+	}
+	// ??? for what?
+	// cgroup_throttle_swaprate(page, GFP_KERNEL);
+
+	/*
+	 * Back out if somebody else already faulted in this pte.
+	 */
+
+	// TODO why don't do this in hermit? no need to generate pte?
+	// vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
+	// 		&vmf->ptl);
+
+
+	ptl = pte_lockptr(vma->vm_mm, vmf->pmd);
+	if(spin_trylock(ptl)){
+		vmf->ptl = ptl;
+	}else{
+		goto out_page;
+	}
+
+
+	if (unlikely(!pte_same(*vmf->pte, vmf->orig_pte))) {
+		adc_pf_breakdown_end(pf_breakdown, ADC_UPD_METADATA,
+				     get_cycles_end());
+		goto out_nomap;
+	}
+
+	//shengkai: should check or not?(prefetch can't do)
+	// if (unlikely(!PageUptodate(page))) {
+	// 	ret = VM_FAULT_SIGBUS;
+	// 	goto out_nomap;
+	// }
+
+	/*
+	 * The page isn't present yet, go ahead with the fault.
+	 *
+	 * Be careful about the sequence of operations here.
+	 * To get its accounting right, reuse_swap_page() must be called
+	 * while the page is counted on swap but not yet in mapcount i.e.
+	 * before page_add_anon_rmap() and swap_free(); try_to_free_swap()
+	 * must be called after the swap_free(), or it will never succeed.
+	 */
+
+	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
+	dec_mm_counter_fast(vma->vm_mm, MM_SWAPENTS);
+	pte = mk_pte(page, vma->vm_page_prot);
+	if ((vmf->flags & FAULT_FLAG_WRITE) && reuse_swap_page(page, NULL)) {
+		pte = maybe_mkwrite(pte_mkdirty(pte), vma);
+		vmf->flags &= ~FAULT_FLAG_WRITE;
+		ret |= VM_FAULT_WRITE;
+		exclusive = RMAP_EXCLUSIVE;
+	}
+	flush_icache_page(vma, page);
+	if (pte_swp_soft_dirty(vmf->orig_pte))
+		pte = pte_mksoft_dirty(pte);
+	if (pte_swp_uffd_wp(vmf->orig_pte)) {
+		pte = pte_mkuffd_wp(pte);
+		pte = pte_wrprotect(pte);
+	}
+	pf_ts = get_cycles_end();
+	adc_pf_breakdown_end(pf_breakdown, ADC_UPD_METADATA, get_cycles_end());
+
+	/* ksm created a completely new copy */
+	if (unlikely(page != swapcache && swapcache)) {
+		page_add_new_anon_rmap(page, vma, vmf->address, false);
+		lru_cache_add_inactive_or_unevictable(page, vma);
+	} else {
+		do_page_add_anon_rmap(page, vma, vmf->address, exclusive);
+	}
+
+	adc_pf_breakdown_stt(pf_breakdown, ADC_SETPTE, pf_cycles_start());
+	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, pte);
+	arch_do_swap_page(vma->vm_mm, vma, vmf->address, pte, vmf->orig_pte);
+
+	vmf->orig_pte = pte;
+
+	swap_free(entry);
+	if (mem_cgroup_swap_full(page) ||
+	    (vma->vm_flags & VM_LOCKED) || PageMlocked(page))
+		try_to_free_swap(page);
+
+	unlock_page(page);
+	if (page != swapcache && swapcache) {
+		/*
+		 * Hold the lock to avoid the swap entry to be reused
+		 * until we take the PT lock for the pte_same() check
+		 * (to avoid false positives from pte_same). For
+		 * further safety release the lock after the swap_free
+		 * so that the swap count won't change under a
+		 * parallel locked swapcache.
+		 */
+		unlock_page(swapcache);
+		put_page(swapcache);
+	}
+	adc_pf_breakdown_end(pf_breakdown, ADC_SETPTE, pf_cycles_end());
+
+	if (vmf->flags & FAULT_FLAG_WRITE) {
+		ret |= do_wp_page(vmf);
+		if (ret & VM_FAULT_ERROR)
+			ret &= VM_FAULT_ERROR;
+		goto out;
+	}
+
+	/* No need to invalidate - it was non-present before */
+	update_mmu_cache(vma, vmf->address, vmf->pte);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+out:
+	if (si)
+		put_swap_device(si);
+	return ret;
+out_nomap:
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+out_page:
+	unlock_page(page);
+out_release:
+	put_page(page);
+	if (page != swapcache && swapcache) {
+		unlock_page(swapcache);
+		put_page(swapcache);
+	}
+	if (si)
+		put_swap_device(si);
+	return ret;
+// [RMGrid] profiling
+out_profiling:
+	pf_ts = get_cycles_end();
+	adc_pf_breakdown_end(pf_breakdown, ADC_LOCK_GET_PTE, pf_ts);
+	adc_pf_breakdown_stt(pf_breakdown, ADC_SET_PAGEMAP_UNLOCK, pf_ts);
+	if (si)
+		put_swap_device(si);
+	BUG_ON(cpu != -1);
+	return ret;
+}
+
+/* shengkai:
+ * swapin_bypass_swapcache - swap in demand page when its swapcount == 1
+ * and bypass the swap cache. Prefetch enabled in this function as well.
+ *
+ * @pagep: the pointer to the struct page for later post processing
+ * Return 0 when succeed or VM_FAULT_OOM when failed
+ */
+static inline vm_fault_t swapin_bypass_swapcache(struct page **pagep,
+							struct vm_fault *vmf,
+							swp_entry_t entry,
+							int *cpu,
+							int *adc_pf_bits,
+							uint64_t pf_breakdown[])
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct page *page;
+	*cpu = -1;
+	// [RMGrid] for frontswap polling
+	void *shadow = NULL;
+
+	// shengkai: 
+	// prefetch params
+	//does it need plug(mark a batch of submitted i/o?)
+	u64 faddr = vmf->address;
+	u64 vaddr = faddr;
+	pte_t *pte, pentry;
+	bool page_allocated;
+	gfp_t gfp_mask = GFP_HIGHUSER_MOVABLE;
+	uint64_t pf_ts = 0;
+	int fcpu = -1;
+	int nr_prefed = 0;
+	struct vma_swap_readahead ra_info = {
+		.win = 1,
+	};
+	// shengkai:
+	// need lock or not?
+	*pagep = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, vmf->address);
+	page = *pagep;
+
+	if (!page) {
+		// adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO,
+		// 		     pf_cycles_end());
+		goto oom;
+	}
+
+	__SetPageLocked(page);
+	__SetPageSwapBacked(page);
+	if (mem_cgroup_swapin_charge_page_profiling(
+		page, vma->vm_mm, GFP_KERNEL, entry,adc_pf_bits, pf_breakdown)) {
+		goto oom;
+	}
+
+	mem_cgroup_swapin_uncharge_swap(entry);
+
+	shadow = get_shadow_from_swap_cache(entry);
+	if (shadow)
+		workingset_refault(page, shadow);
+
+	*cpu = get_cpu();
+
+	/* To provide entry to swap_readpage() */
+	set_page_private(page, entry.val);
+	swap_readpage(page, true);
+	set_page_private(page, 0);
+	// frontswap_poll_load(cpu); do poll later
+	put_cpu();
+
+	// [RMGrid] profiling
+	set_adc_pf_bits(adc_pf_bits, ADC_PF_MAJOR_BIT);
+	adc_profile_counter_inc(ADC_ONDEMAND_SWAPIN);
+	// count_memcg_event_mm(vma->vm_mm,ONDEMAND_SWAPIN);
+
+	// for prefetching
+	swap_ra_info(vmf, &ra_info);
+	adc_pf_breakdown_stt(pf_breakdown, ADC_PREFETCH, pf_cycles_start());
+
+	if(ra_info.win == 1)
+		goto done;
+
+	fcpu = *cpu;
+	for (int i = 0, pte = &ra_info->ptes[i]; i < ra_info->nr_pte;
+	     i++, pte++) {
+		//end prefetch when load sync done
+		if (fcpu != -1 && frontswap_peek_load(fcpu) == 0)
+			break;
+		if (i == ra_info->offset)
+			continue;
+		pentry = *pte;
+		if (pte_none(pentry))
+			continue;
+		if (pte_present(pentry))
+			continue;
+		entry = pte_to_swp_entry(pentry);
+		if (unlikely(non_swap_entry(entry)))
+			continue;
+		vaddr = faddr + ((unsigned long)i - (unsigned long)ra_info->offset) * PAGE_SIZE;
+		// pf_ts = get_cycles_start();
+		// adc_pf_breakdown_stt(pf_breakdown, ADC_RD_CACHE_ASYNC, pf_ts);
+		page = __read_swap_cache_async_profiling(
+			entry, GFP_HIGHUSER_MOVABLE, vma, faddr,
+			&page_allocated, adc_pf_bits, pf_breakdown);
+		// pf_ts = get_cycles_end();
+		// adc_pf_breakdown_end(pf_breakdown, ADC_RD_CACHE_ASYNC, pf_ts);
+		if (!page)
+    		continue;
+		if (page_allocated) {
+			swap_readpage_async(page, vaddr, vma, pte, pentry);
+			SetPageReadahead(page);
+			count_vm_event(SWAP_RA);
+			set_page_prefetch(page);
+			// [RMGrid] profiling
+			adc_profile_counter_inc(ADC_PREFETCH_SWAPIN);
+			nr_prefed++;
+		}
+		put_page(page);
+	}
+
+done:
+	adc_pf_breakdown_end(pf_breakdown, ADC_PREFETCH, pf_cycles_end());
+	lru_cache_add(page);
+	return 0;
+oom:
+	//lazy poll can't get specific io time
+	// adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO, pf_cycles_end());
+	return VM_FAULT_OOM;
+}
+
 /*
  * We enter with non-exclusive mmap_lock (to exclude vma changes,
  * but allow concurrent faults), and pte mapped but not yet locked.
@@ -3491,9 +3891,13 @@ vm_fault_t do_swap_page_profiling(struct vm_fault *vmf, int *adc_pf_bits,
 	int locked;
 	int exclusive = 0;
 	vm_fault_t ret = 0;
-	void *shadow = NULL;
 	// [RMGrid] profiling
 	uint64_t pf_ts;
+	//shengkai: hermit params
+	int cpu = -1;
+	// spinlock_t *ptl = NULL;
+	// unsigned long old_pte_val;
+	bool bypass_sc = false;
 	//ignore! check if others has changed pte
 	if (!pte_unmap_same(vma->vm_mm, vmf->pmd, vmf->pte, vmf->orig_pte))
 		goto out_profiling;
@@ -3546,66 +3950,30 @@ vm_fault_t do_swap_page_profiling(struct vm_fault *vmf, int *adc_pf_bits,
 		}
 	}
 	if (!page) {
-		pf_ts = get_cycles_start();
-		adc_pf_breakdown_stt(pf_breakdown, ADC_PAGE_IO, pf_ts);
-		if (data_race(si->flags & SWP_SYNCHRONOUS_IO) &&
-		    __swap_count(entry) == 1) {
-			/* skip swapcache */
-			page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma,
-					      vmf->address);
-			if (page) {
-				int cpu; // [RMGrid] for frontswap polling
-				//not ignore, unlock in call back function, and clear swapbacked?, by pass swapcache
-				__SetPageLocked(page);
-				__SetPageSwapBacked(page);
-
-				adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO,
-						     get_cycles_end());
-				// register page into cgroup to make sure not OOM, prepare for readpage
-				if (mem_cgroup_swapin_charge_page_profiling(
-					    page, vma->vm_mm, GFP_KERNEL, entry,
-					    adc_pf_bits, pf_breakdown)) {
-					ret = VM_FAULT_OOM;
-					pf_ts = get_cycles_end();
-					adc_pf_breakdown_stt(
-						pf_breakdown,
-						ADC_SET_PAGEMAP_UNLOCK, pf_ts);
-					goto out_page;
-				}
-				adc_pf_breakdown_stt(pf_breakdown, ADC_PAGE_IO,
-						     get_cycles_start());
-				// after success charging page for swapin
-				mem_cgroup_swapin_uncharge_swap(entry);
-				//ignore! fault infomation?
-				shadow = get_shadow_from_swap_cache(entry);
-				if (shadow)
-					workingset_refault(page, shadow);
-				//no need to add to swapcache
-				lru_cache_add(page);
-
-				cpu = get_cpu();
-				/* To provide entry to swap_readpage() */
-				set_page_private(page, entry.val);
-				swap_readpage(page, true);
-				set_page_private(page, 0);
-				frontswap_poll_load(cpu);
-				put_cpu();
-				// [RMGrid] profiling
-				set_adc_pf_bits(adc_pf_bits, ADC_PF_MAJOR_BIT);
-				adc_profile_counter_inc(ADC_ONDEMAND_SWAPIN);
-				count_memcg_event_mm(vma->vm_mm,
-						     ONDEMAND_SWAPIN);
+		if (__swap_count(entry) == 1) {
+			vm_fault_t func_ret = 0;
+			// adc_pf_breakdown_stt(pf_breakdown, ADC_PAGE_IO,
+			// 		     pf_cycles_start());
+			func_ret = swapin_bypass_swapcache(
+				&page, vmf, entry, &cpu, adc_pf_bits,
+				pf_breakdown);
+			if (func_ret) { // failed, goto out_page directly
+				ret = func_ret;
+				adc_pf_breakdown_stt(pf_breakdown,
+						     ADC_SET_PAGEMAP_UNLOCK,
+						     pf_cycles_start());
+				goto out_release;
 			}
+			bypass_sc = true;
 		} else {
 			//second path for on-demand paging(in swapcache) and prefetch
 			page = swapin_readahead_profiling(entry,
 							  GFP_HIGHUSER_MOVABLE,
 							  vmf, adc_pf_bits,
-							  pf_breakdown);
+							  pf_breakdown, &cpu);
 			swapcache = page;
 		}
 		pf_ts = get_cycles_end();
-		adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO, pf_ts);
 
 		if (!page) {
 			/*
@@ -3643,16 +4011,20 @@ vm_fault_t do_swap_page_profiling(struct vm_fault *vmf, int *adc_pf_bits,
 	pf_ts = get_cycles_start();
 	adc_pf_breakdown_stt(pf_breakdown, ADC_SET_PAGEMAP_UNLOCK, pf_ts);
 	adc_pf_breakdown_stt(pf_breakdown, ADC_UPD_METADATA, pf_ts);
-	locked = lock_page_or_retry(page, vma->vm_mm, vmf->flags);
+	// shengkai: not poll here, retry when can't get lock ?
+	// locked = lock_page_or_retry(page, vma->vm_mm, vmf->flags);
+	if(cpu == -1){// faulted page will be locked until callback
+		// locked = trylock_page(page);
+		locked = lock_page_or_retry(page, vma->vm_mm, vmf->flags);
 
-	delayacct_clear_flag(current, DELAYACCT_PF_SWAPIN);
-	if (!locked) {
-		ret |= VM_FAULT_RETRY;
-		adc_pf_breakdown_end(pf_breakdown, ADC_UPD_METADATA,
-				     get_cycles_end());
-		goto out_release;
+		delayacct_clear_flag(current, DELAYACCT_PF_SWAPIN);
+		if (!locked) {
+			ret |= VM_FAULT_RETRY;
+			adc_pf_breakdown_end(pf_breakdown, ADC_UPD_METADATA,
+						get_cycles_end());
+			goto out_release;
+		}
 	}
-
 	/*
 	 * Make sure try_to_free_swap or reuse_swap_page or swapoff did not
 	 * release the swapcache from under us.  The page pin, and pte_same
@@ -3675,8 +4047,16 @@ vm_fault_t do_swap_page_profiling(struct vm_fault *vmf, int *adc_pf_bits,
 				     get_cycles_end());
 		goto out_page;
 	}
-	//???
-	cgroup_throttle_swaprate(page, GFP_KERNEL);
+	//question point : for what?
+	// cgroup_throttle_swaprate(page, GFP_KERNEL);
+
+	//shengkai: does it proper to load here?
+	if(cpu != -1){
+		frontswap_poll_load(cpu);
+		cpu = -1;
+		// adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO,
+		// 				pf_cycles_end());
+	}
 
 	/*
 	 * Back out if somebody else already faulted in this pte.
@@ -3688,7 +4068,7 @@ vm_fault_t do_swap_page_profiling(struct vm_fault *vmf, int *adc_pf_bits,
 				     get_cycles_end());
 		goto out_nomap;
 	}
-	//why need to check uptodate?
+	// shengkai: TODO set page uptodate in rswap
 	if (unlikely(!PageUptodate(page))) {
 		ret = VM_FAULT_SIGBUS;
 		adc_pf_breakdown_end(pf_breakdown, ADC_UPD_METADATA,
@@ -3736,6 +4116,7 @@ vm_fault_t do_swap_page_profiling(struct vm_fault *vmf, int *adc_pf_bits,
 	} else {
 		do_page_add_anon_rmap(page, vma, vmf->address, exclusive);
 	}
+	// shengkai : question: hermit poll again here why ?
 
 	swap_free(entry);
 	if (mem_cgroup_swap_full(page) ||

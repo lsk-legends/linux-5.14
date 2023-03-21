@@ -39,6 +39,8 @@ static const struct address_space_operations swap_aops = {
 #ifdef CONFIG_MIGRATION
 	.migratepage	= migrate_page,
 #endif
+	.writepage_on_core = swap_writepage_on_core,
+	// .poll_write = frontswap_poll_store,
 };
 
 struct address_space *swapper_spaces[MAX_SWAPFILES] __read_mostly;
@@ -564,7 +566,7 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 		put_cpu();
 		// [RMGrid] profiling
 		adc_profile_counter_inc(ADC_ONDEMAND_SWAPIN);
-		count_memcg_event_mm(vma->vm_mm, ONDEMAND_SWAPIN);
+		// count_memcg_event_mm(vma->vm_mm, ONDEMAND_SWAPIN);
 	}
 
 	return retpage;
@@ -652,7 +654,7 @@ static unsigned long swapin_nr_pages(unsigned long offset)
 struct page *swap_cluster_readahead_profiling(swp_entry_t entry, gfp_t gfp_mask,
 					      struct vm_fault *vmf,
 					      int *adc_pf_bits,
-					      uint64_t pf_breakdown[])
+					      uint64_t pf_breakdown[], int* cpu)
 {
 	struct page *page;
 	unsigned long entry_offset = swp_offset(entry);
@@ -666,9 +668,9 @@ struct page *swap_cluster_readahead_profiling(swp_entry_t entry, gfp_t gfp_mask,
 	unsigned long addr = vmf->address;
 
 	// [RMGrid]
-	int cpu;
 	struct page *fault_page;
 	bool demand_page_allocated;
+	int fcpu = -1;
 
 	mask = swapin_nr_pages(offset) - 1;
 
@@ -678,14 +680,14 @@ struct page *swap_cluster_readahead_profiling(swp_entry_t entry, gfp_t gfp_mask,
 						  &demand_page_allocated,
 						  adc_pf_bits, pf_breakdown);
 	if (demand_page_allocated) {
-		cpu = get_cpu();
+		*cpu = get_cpu();
 		swap_readpage(fault_page, do_poll);
 		put_cpu();
 		// [RMGrid] profiling
 		set_adc_pf_bits(adc_pf_bits, ADC_PF_MAJOR_BIT);
 		adc_profile_counter_inc(ADC_ONDEMAND_SWAPIN);
-		if (vma && vma->vm_mm)
-			count_memcg_event_mm(vma->vm_mm, ONDEMAND_SWAPIN);
+		// if (vma && vma->vm_mm)
+		// 	count_memcg_event_mm(vma->vm_mm, ONDEMAND_SWAPIN);
 	}
 
 	if (!mask)
@@ -706,9 +708,12 @@ struct page *swap_cluster_readahead_profiling(swp_entry_t entry, gfp_t gfp_mask,
 		start_offset++;
 	if (end_offset >= si->max)
 		end_offset = si->max - 1;
-
+	fcpu = *cpu;
 	blk_start_plug(&plug);
 	for (offset = start_offset; offset <= end_offset ; offset++) {
+		//end prefetch when load sync done
+		if (fcpu != -1 && frontswap_peek_load(fcpu) == 0)
+			break;
 		if (offset == entry_offset)
 			continue;
 		/* Ok, do the async read-ahead now */
@@ -718,9 +723,9 @@ struct page *swap_cluster_readahead_profiling(swp_entry_t entry, gfp_t gfp_mask,
 		if (!page)
 			continue;
 		if (page_allocated) {
-			swap_readpage_async(page);
+			swap_readpage(page, false);
 			SetPageReadahead(page);
-			count_vm_event(SWAP_RA);
+			// count_vm_event(SWAP_RA);
 			set_page_prefetch(page);
 			// [RMGrid] profiling
 			adc_profile_counter_inc(ADC_PREFETCH_SWAPIN);
@@ -732,12 +737,12 @@ struct page *swap_cluster_readahead_profiling(swp_entry_t entry, gfp_t gfp_mask,
 	}
 	blk_finish_plug(&plug);
 
-	lru_add_drain();	/* Push any new pages onto the LRU now */
+	// lru_add_drain();	/* Push any new pages onto the LRU now */
 skip:
 	if (demand_page_allocated) {
 		adc_pf_breakdown_stt(pf_breakdown, ADC_POLL_LOAD,
 				     get_cycles_start());
-		frontswap_poll_load(cpu);
+		frontswap_poll_load(*cpu);
 		adc_pf_breakdown_end(pf_breakdown, ADC_POLL_LOAD,
 				     get_cycles_end());
 	}
@@ -747,8 +752,9 @@ skip:
 inline struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 				struct vm_fault *vmf)
 {
+	int cpu;
 	return swap_cluster_readahead_profiling(entry, gfp_mask, vmf, NULL,
-						NULL);
+						NULL, &cpu);
 }
 
 int init_swap_address_space(unsigned int type, unsigned long nr_pages)
@@ -879,7 +885,7 @@ static struct page *swap_vma_readahead_profiling(swp_entry_t fentry,
 						 gfp_t gfp_mask,
 						 struct vm_fault *vmf,
 						 int *adc_pf_bits,
-						 uint64_t pf_breakdown[])
+						 uint64_t pf_breakdown[],int* cpu)
 {
 	struct blk_plug plug;
 	struct vm_area_struct *vma = vmf->vma;
@@ -893,10 +899,11 @@ static struct page *swap_vma_readahead_profiling(swp_entry_t fentry,
 	};
 
 	// [RMGrid]
-	int cpu;
 	struct page *fault_page;
 	bool demand_page_allocated;
-
+	int fcpu = -1;
+	u64 faddr = vmf->address;
+	u64 vaddr = faddr;
 	swap_ra_info(vmf, &ra_info);
 
 	// [RMGrid] issue demand page read first
@@ -907,22 +914,25 @@ static struct page *swap_vma_readahead_profiling(swp_entry_t fentry,
 					pf_breakdown);
 	adc_pf_breakdown_end(pf_breakdown, ADC_DEDUP_SWAPIN, get_cycles_end());
 	if (demand_page_allocated) {
-		cpu = get_cpu();
+		*cpu = get_cpu();
 		swap_readpage(fault_page, ra_info.win == 1);
 		put_cpu();
 		// [RMGrid] profiling
 		set_adc_pf_bits(adc_pf_bits, ADC_PF_MAJOR_BIT);
 		adc_profile_counter_inc(ADC_ONDEMAND_SWAPIN);
-		count_memcg_event_mm(vma->vm_mm, ONDEMAND_SWAPIN);
+		// count_memcg_event_mm(vma->vm_mm, ONDEMAND_SWAPIN);
 	}
 
 	if (ra_info.win == 1)
 		goto skip;
-
+	fcpu = *cpu;
 	adc_pf_breakdown_stt(pf_breakdown, ADC_PREFETCH, get_cycles_start());
 	blk_start_plug(&plug);
 	for (i = 0, pte = ra_info.ptes; i < ra_info.nr_pte;
 	     i++, pte++) {
+		//end prefetch when load sync done
+		if (fcpu != -1 && frontswap_peek_load(fcpu) == 0)
+			break;
 		if (i == ra_info.offset)
 			continue;
 		pentry = *pte;
@@ -933,15 +943,17 @@ static struct page *swap_vma_readahead_profiling(swp_entry_t fentry,
 		entry = pte_to_swp_entry(pentry);
 		if (unlikely(non_swap_entry(entry)))
 			continue;
+		vaddr = faddr + ((unsigned long)i - (unsigned long)ra_info->offset) * PAGE_SIZE;
 		page = __read_swap_cache_async_profiling(entry, gfp_mask, vma,
 					       vmf->address, &page_allocated,
 					       adc_pf_bits, pf_breakdown);
 		if (!page)
 			continue;
+		
 		if (page_allocated) {
-			swap_readpage_async(page);
+			swap_readpage_async(page, vaddr, vma, pte, pentry);
 			SetPageReadahead(page);
-			count_vm_event(SWAP_RA);
+			// count_vm_event(SWAP_RA);
 			set_page_prefetch(page);
 			// [RMGrid] profiling
 			adc_profile_counter_inc(ADC_PREFETCH_SWAPIN);
@@ -950,23 +962,25 @@ static struct page *swap_vma_readahead_profiling(swp_entry_t fentry,
 		put_page(page);
 	}
 	blk_finish_plug(&plug);
-	lru_add_drain();
+	// lru_add_drain();
 	adc_pf_breakdown_end(pf_breakdown, ADC_PREFETCH, get_cycles_end());
 skip:
-	if (demand_page_allocated) {
-		adc_pf_breakdown_stt(pf_breakdown, ADC_POLL_LOAD,
-				     get_cycles_start());
-		frontswap_poll_load(cpu);
-		adc_pf_breakdown_end(pf_breakdown, ADC_POLL_LOAD,
-				     get_cycles_end());
-	}
+	// LAZY poll load			poll when lazy
+	// if (demand_page_allocated) {
+	// 	adc_pf_breakdown_stt(pf_breakdown, ADC_POLL_LOAD,
+	// 			     get_cycles_start());
+	// 	frontswap_poll_load(cpu);
+	// 	adc_pf_breakdown_end(pf_breakdown, ADC_POLL_LOAD,
+	// 			     get_cycles_end());
+	// }
 	return fault_page;
 }
 
 inline static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
 				       struct vm_fault *vmf)
 {
-	return swap_vma_readahead_profiling(fentry, gfp_mask, vmf, NULL, NULL);
+	int cpu
+	return swap_vma_readahead_profiling(fentry, gfp_mask, vmf, NULL, NULL, &cpu);
 }
 
 /**
@@ -991,13 +1005,13 @@ struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
 
 struct page *swapin_readahead_profiling(swp_entry_t entry, gfp_t gfp_mask,
 					struct vm_fault *vmf, int *adc_pf_bits,
-					uint64_t pf_breakdown[])
+					uint64_t pf_breakdown[], int* cpu)
 {
 	return swap_use_vma_readahead() ?
 			     swap_vma_readahead_profiling(entry, gfp_mask, vmf,
-						    adc_pf_bits, pf_breakdown) :
+						    adc_pf_bits, pf_breakdown, cpu) :
 			     swap_cluster_readahead_profiling(
-			       entry, gfp_mask, vmf, adc_pf_bits, pf_breakdown);
+			       entry, gfp_mask, vmf, adc_pf_bits, pf_breakdown, cpu);
 }
 
 #ifdef CONFIG_SYSFS

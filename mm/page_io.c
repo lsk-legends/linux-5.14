@@ -252,11 +252,53 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 	}
 	pf_ts = get_cycles_start();
 	if (frontswap_store(page) == 0) {
-		set_page_writeback(page);
-		unlock_page(page);
-		end_page_writeback(page);
+		// set_page_writeback(page);
+		// unlock_page(page);
+		// end_page_writeback(page);
 		accum_adc_time_stat(ADC_RDMA_WRITE_LAT,
 				    get_cycles_end() - pf_ts);
+		goto out;
+	} else {
+		accum_adc_time_stat(ADC_RDMA_WRITE_LAT,
+				    get_cycles_end() - pf_ts);
+	}
+	ret = __swap_writepage(page, wbc, end_swap_bio_write);
+out:
+	return ret;
+}
+
+int swap_writepage_on_core(struct page *page, struct writeback_control *wbc,
+			   int core)
+{
+	int ret = 0;
+	// [RMGrid]
+	uint64_t pf_ts;
+
+	adc_profile_counter_inc(ADC_SWAPOUT);
+
+	if (try_to_free_swap(page)) {
+		unlock_page(page);
+		goto out;
+	}
+	/*
+	 * Arch code may have to preserve more data than just the page
+	 * contents, e.g. memory tags.
+	 */
+	ret = arch_prepare_to_swap(page);
+	if (ret) {
+		set_page_dirty(page);
+		unlock_page(page);
+		goto out;
+	}
+	pf_ts = get_cycles_start();
+	if (frontswap_store_on_core(page, core) == 0) {
+		/* [Hermit] YIFAN: move to the callback when writedone, to
+		 * enable async write.
+		 */
+		// set_page_writeback(page);
+		// unlock_page(page);
+		// end_page_writeback(page);
+		accum_adc_time_stat(ADC_RDMA_WRITE_LAT, pf_ts);
 		goto out;
 	} else {
 		accum_adc_time_stat(ADC_RDMA_WRITE_LAT,
@@ -366,7 +408,7 @@ int __swap_writepage(struct page *page, struct writeback_control *wbc,
 	return 0;
 }
 
-int swap_readpage(struct page *page, bool synchronous)
+int swap_readpage(struct page *page, bool do_poll)
 {
 	struct bio *bio;
 	int ret = 0;
@@ -374,6 +416,9 @@ int swap_readpage(struct page *page, bool synchronous)
 	blk_qc_t qc;
 	struct gendisk *disk;
 	unsigned long pflags;
+	// [RMGrid]
+	// question point : false
+	bool synchronous = do_poll;
 
 	uint64_t pf_ts;
 
@@ -381,24 +426,24 @@ int swap_readpage(struct page *page, bool synchronous)
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	VM_BUG_ON_PAGE(PageUptodate(page), page);
 
-	/*
-	 * Count submission time as memory stall. When the device is congested,
-	 * or the submitting cgroup IO-throttled, submission can be a
-	 * significant part of overall IO time.
-	 */
-	psi_memstall_enter(&pflags);
-
 	pf_ts = get_cycles_start();
 	if (frontswap_load(page) == 0) {
 		// SetPageUptodate(page);
 		// unlock_page(page);
 		accum_adc_time_stat(ADC_RDMA_READ_LAT,
 				    get_cycles_end() - pf_ts);
-		goto out;
+		return 0;
 	} else {
 		accum_adc_time_stat(ADC_RDMA_READ_LAT,
 				    get_cycles_end() - pf_ts);
 	}
+	// delete it. from front swap
+	/*
+	 * Count submission time as memory stall. When the device is congested,
+	 * or the submitting cgroup IO-throttled, submission can be a
+	 * significant part of overall IO time.
+	 */
+	psi_memstall_enter(&pflags);
 
 	if (data_race(sis->flags & SWP_FS_OPS)) {
 		struct file *swap_file = sis->swap_file;
@@ -460,7 +505,7 @@ out:
 	return ret;
 }
 
-int swap_readpage_async(struct page *page)
+int swap_readpage_async(struct page *page, u64 vaddr,struct vm_area_struct *vma, pte_t* ptep, pte_t orig_pte)
 {
 	struct bio *bio;
 	int ret = 0;
@@ -471,8 +516,16 @@ int swap_readpage_async(struct page *page)
 	// [RMGrid]
 	bool synchronous = false;
 
+	// VM_BUG_ON_PAGE(!PageSwapCache(page), page);
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	VM_BUG_ON_PAGE(PageUptodate(page), page);
+
+	if (frontswap_load_async(page,vaddr,vma,ptep,orig_pte) == 0) {
+		// shengkai: do this in call back
+		// SetPageUptodate(page);
+		// unlock_page(page);
+		return 0;
+	}
 
 	/*
 	 * Count submission time as memory stall. When the device is congested,
@@ -480,12 +533,6 @@ int swap_readpage_async(struct page *page)
 	 * significant part of overall IO time.
 	 */
 	psi_memstall_enter(&pflags);
-
-	if (frontswap_load_async(page) == 0) {
-		// SetPageUptodate(page);
-		// unlock_page(page);
-		goto out;
-	}
 
 	if (data_race(sis->flags & SWP_FS_OPS)) {
 		struct file *swap_file = sis->swap_file;

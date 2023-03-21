@@ -17,9 +17,12 @@
 struct frontswap_ops {
 	void (*init)(unsigned); /* this swap type was just swapon'ed */
 	int (*store)(unsigned, pgoff_t, struct page *); /* store a page */
+	int (*store_on_core)(unsigned, pgoff_t, struct page *, int); /* store a page with specific core*/
+	int (*poll_store)(int); /* poll cpu for store */
 	int (*load)(unsigned, pgoff_t, struct page *); /* load a page */
 	int (*load_async)(unsigned, pgoff_t, struct page *); /* async load a page */
 	int (*poll_load)(int); /* poll cpu for one load */
+	int (*peek_load)(int); /* peek cpu for sync load */
 	void (*invalidate_page)(unsigned, pgoff_t); /* page no longer needed */
 	void (*invalidate_area)(unsigned); /* swap type just swapoff'ed */
 	struct frontswap_ops *next; /* private pointer to next ops */
@@ -35,9 +38,12 @@ extern void frontswap_tmem_exclusive_gets(bool);
 extern bool __frontswap_test(struct swap_info_struct *, pgoff_t);
 extern void __frontswap_init(unsigned type, unsigned long *map);
 extern int __frontswap_store(struct page *page);
+extern int __frontswap_store_on_core(struct page *page, int core);
+extern int __frontswap_poll_store(int cpu);
 extern int __frontswap_load(struct page *page);
-extern int __frontswap_load_async(struct page *page);
+extern int __frontswap_load_async(struct page *page, u64 vaddr,struct vm_area_struct *vma, pte_t* ptep, pte_t orig_pte);
 extern int __frontswap_poll_load(int cpu);
+extern int __frontswap_peek_load(int cpu);
 extern void __frontswap_invalidate_page(unsigned, pgoff_t);
 extern void __frontswap_invalidate_area(unsigned);
 
@@ -97,6 +103,22 @@ static inline int frontswap_store(struct page *page)
 	return -1;
 }
 
+static inline int frontswap_store_on_core(struct page *page, int core)
+{
+	if (frontswap_enabled())
+		return __frontswap_store_on_core(page, core);
+
+	return -1;
+}
+
+static inline int frontswap_poll_store(int cpu)
+{
+	if (frontswap_enabled())
+		return __frontswap_poll_store(cpu);
+
+	return -1;
+}
+
 static inline int frontswap_load(struct page *page)
 {
 	if (frontswap_enabled())
@@ -105,10 +127,10 @@ static inline int frontswap_load(struct page *page)
 	return -1;
 }
 
-static inline int frontswap_load_async(struct page *page)
+static inline int frontswap_load_async(struct page *page, u64 vaddr,struct vm_area_struct *vma, pte_t* ptep, pte_t orig_pte)
 {
 	if (frontswap_enabled())
-		return __frontswap_load_async(page);
+		return __frontswap_load_async(page,vaddr,vma,ptep,orig_pte);
 
 	return -1;
 }
@@ -117,6 +139,14 @@ static inline int frontswap_poll_load(int cpu)
 {
 	if (frontswap_enabled())
 		return __frontswap_poll_load(cpu);
+
+	return -1;
+}
+
+static inline int frontswap_peek_load(int cpu)
+{
+	if (frontswap_enabled())
+		return __frontswap_peek_load(cpu);
 
 	return -1;
 }

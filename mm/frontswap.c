@@ -267,11 +267,11 @@ int __frontswap_store(struct page *page)
 	 * and we can't rely on the new page replacing the old page as we may
 	 * not store to the same implementation that contains the old page.
 	 */
-	if (__frontswap_test(sis, offset)) {
-		__frontswap_clear(sis, offset);
-		for_each_frontswap_ops(ops)
-			ops->invalidate_page(type, offset);
-	}
+	// if (__frontswap_test(sis, offset)) {
+	// 	__frontswap_clear(sis, offset);
+	// 	for_each_frontswap_ops(ops)
+	// 		ops->invalidate_page(type, offset);
+	// }
 
 	/* Try to store in each implementation, until one succeeds. */
 	for_each_frontswap_ops(ops) {
@@ -292,6 +292,64 @@ int __frontswap_store(struct page *page)
 }
 EXPORT_SYMBOL(__frontswap_store);
 
+int __frontswap_store_on_core(struct page *page, int core)
+{
+	int ret = -1;
+	swp_entry_t entry = { .val = page_private(page), };
+	int type = swp_type(entry);
+	struct swap_info_struct *sis = swap_info[type];
+	pgoff_t offset = swp_offset(entry);
+	struct frontswap_ops *ops;
+
+	VM_BUG_ON(!frontswap_ops);
+	VM_BUG_ON(!PageLocked(page));
+	VM_BUG_ON(sis == NULL);
+
+	/*
+	 * If a dup, we must remove the old page first; we can't leave the
+	 * old page no matter if the store of the new page succeeds or fails,
+	 * and we can't rely on the new page replacing the old page as we may
+	 * not store to the same implementation that contains the old page.
+	 */
+	// if (__frontswap_test(sis, offset)) {
+	// 	__frontswap_clear(sis, offset);
+	// 	for_each_frontswap_ops(ops)
+	// 		ops->invalidate_page(type, offset);
+	// }
+
+	/* Try to store in each implementation, until one succeeds. */
+	for_each_frontswap_ops(ops) {
+		ret = ops->store_on_core(type, offset, page, core);
+		if (!ret) /* successful store */
+			break;
+	}
+	if (ret == 0) {
+		__frontswap_set(sis, offset);
+		inc_frontswap_succ_stores();
+	} else {
+		inc_frontswap_failed_stores();
+	}
+	if (frontswap_writethrough_enabled)
+		/* report failure so swap also writes to swap device */
+		ret = -1;
+	return ret;
+}
+EXPORT_SYMBOL(__frontswap_store_on_core);
+
+int __frontswap_poll_store(int cpu)
+{
+	struct frontswap_ops *ops;
+
+	VM_BUG_ON(!frontswap_ops);
+
+	for_each_frontswap_ops(ops)
+		return ops->poll_store(cpu);
+
+	BUG();
+	return -1;
+}
+EXPORT_SYMBOL(__frontswap_poll_store);
+
 /*
  * "Get" data from frontswap associated with swaptype and offset that were
  * specified when the data was put to frontswap and use it to fill the
@@ -310,8 +368,8 @@ int __frontswap_load(struct page *page)
 	VM_BUG_ON(!PageLocked(page));
 	VM_BUG_ON(sis == NULL);
 
-	if (!__frontswap_test(sis, offset))
-		return -1;
+	// if (!__frontswap_test(sis, offset))
+	// 	return -1;
 
 	/* Try loading from each implementation, until one succeeds. */
 	for_each_frontswap_ops(ops) {
@@ -330,7 +388,7 @@ int __frontswap_load(struct page *page)
 }
 EXPORT_SYMBOL(__frontswap_load);
 
-int __frontswap_load_async(struct page *page)
+int __frontswap_load_async(struct page *page, u64 vaddr,struct vm_area_struct *vma, pte_t* ptep, pte_t orig_pte)
 {
 	int ret = -1;
 	swp_entry_t entry = { .val = page_private(page), };
@@ -343,15 +401,17 @@ int __frontswap_load_async(struct page *page)
 	VM_BUG_ON(!PageLocked(page));
 	VM_BUG_ON(sis == NULL);
 
-	if (!__frontswap_test(sis, offset))
-		return -1;
+	// if (!__frontswap_test(sis, offset))
+	// 	return -1;
 
 	/* Try loading from each implementation, until one succeeds. */
 	for_each_frontswap_ops(ops) {
-		ret = ops->load_async(type, offset, page);
+		ret = ops->load_async(offset, page, vaddr, vma,ptep, orig_pte);
 		if (!ret) /* successful load */
 			break;
 	}
+	// shengkai:
+	// do it in callback? can't get sis in callback?
 	if (ret == 0) {
 		inc_frontswap_loads();
 		if (frontswap_tmem_exclusive_gets_enabled) {
@@ -376,6 +436,20 @@ int __frontswap_poll_load(int cpu)
 	return -1;
 }
 EXPORT_SYMBOL(__frontswap_poll_load);
+
+//shengkai: add peek load
+int __frontswap_peek_load(int core)
+{
+	struct frontswap_ops *ops;
+
+	VM_BUG_ON(!frontswap_ops);
+
+	for_each_frontswap_ops(ops)
+		return ops->peek_load(core);
+
+	BUG();
+	return -1;
+}
 
 /*
  * Invalidate any data from frontswap associated with the specified swaptype

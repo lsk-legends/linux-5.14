@@ -423,8 +423,11 @@ extern void kswapd_stop(int nid);
 
 /* linux/mm/page_io.c */
 extern int swap_readpage(struct page *page, bool do_poll);
-extern int swap_readpage_async(struct page *page);
+extern int swap_readpage_async(struct page *page, u64 vaddr,
+					struct vm_area_struct *vma, pte_t* ptep, pte_t orig_pte);
 extern int swap_writepage(struct page *page, struct writeback_control *wbc);
+extern int swap_writepage_on_core(struct page *page,
+				  struct writeback_control *wbc, int core);
 extern void end_swap_bio_write(struct bio *bio);
 extern int __swap_writepage(struct page *page, struct writeback_control *wbc,
 	bio_end_io_t end_write_func);
@@ -476,10 +479,11 @@ extern struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t flag,
 				struct vm_fault *vmf);
 extern struct page *swapin_readahead(swp_entry_t entry, gfp_t flag,
 				struct vm_fault *vmf);
+//shengkai: add poll params
 extern struct page *swapin_readahead_profiling(swp_entry_t entry, gfp_t flag,
 					       struct vm_fault *vmf,
 					       int *adc_pf_bits,
-					       uint64_t pf_breakdown[]);
+					       uint64_t pf_breakdown[], int *cpu);
 
 /* linux/mm/swapfile.c */
 extern atomic_long_t nr_swap_pages;
@@ -630,12 +634,17 @@ static inline struct page *swapin_readahead_profiling(swp_entry_t swp,
 						      gfp_t gfp_mask,
 						      struct vm_fault *vmf,
 						      int *adc_pf_bits,
-						      uint64_t pf_breakdown[])
+						      uint64_t pf_breakdown[], int *cpu)
 {
 	return NULL;
 }
 
 static inline int swap_writepage(struct page *p, struct writeback_control *wbc)
+{
+	return 0;
+}
+
+static inline int swap_writepage_on_core(struct page *p, struct writeback_control *wbc, int core)
 {
 	return 0;
 }

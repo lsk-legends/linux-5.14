@@ -63,6 +63,7 @@
 
 // [RMGrid]
 #include <linux/swap_stats.h>
+#include <linux/frontswap.h> /* for frontswap_{store_on_core|poll_store}() */
 
 struct scan_control {
 	/* How many pages shrink_list() should reclaim */
@@ -971,12 +972,14 @@ typedef enum {
 	PAGE_CLEAN,
 } pageout_t;
 
+#define HMT_INV_CORE -1
+
 /*
  * pageout is called by shrink_page_list() for each dirty page.
  * Calls ->writepage().
  */
 static pageout_t pageout_profiling(struct page *page,
-				   struct address_space *mapping,
+				   struct address_space *mapping, int cpu,
 				   uint64_t pf_breakdown[])
 {
 	pageout_t ret = PAGE_KEEP;
@@ -1017,7 +1020,10 @@ static pageout_t pageout_profiling(struct page *page,
 		ret = PAGE_KEEP;
 		goto profiling;
 	}
-	if (mapping->a_ops->writepage == NULL) {
+	if (!PageAnon(page))
+		cpu = HMT_INV_CORE;
+	// shengkai : question point, we check if core == -1 in rswap 
+	if (mapping->a_ops->writepage_on_core == NULL) {
 		ret = PAGE_ACTIVATE;
 		goto profiling;
 	}
@@ -1037,7 +1043,11 @@ static pageout_t pageout_profiling(struct page *page,
 		};
 
 		SetPageReclaim(page);
-		res = mapping->a_ops->writepage(page, &wbc);
+		if (cpu == HMT_INV_CORE) // [Hermit] default sync write
+			res = mapping->a_ops->writepage(page, &wbc);
+		else // [Hermit] RDMA write to a certain core's queue
+			res = mapping->a_ops->writepage_on_core(page, &wbc,
+								cpu);
 		if (res < 0)
 			handle_write_error(mapping, page, res);
 		if (res == AOP_WRITEPAGE_ACTIVATE) {
@@ -1064,7 +1074,7 @@ profiling:
 
 static inline pageout_t pageout(struct page *page, struct address_space *mapping)
 {
-	return pageout_profiling(page, mapping, NULL);
+	return pageout_profiling(page, mapping, HMT_INV_CORE ,NULL);
 }
 
 /*
@@ -1294,6 +1304,335 @@ static void page_check_dirty_writeback(struct page *page,
 	if (mapping && mapping->a_ops->is_dirty_writeback)
 		mapping->a_ops->is_dirty_writeback(page, dirty, writeback);
 }
+// shengkai : 
+// deal with clean pages and try to add them to free page list
+static inline int post_pageout_rls_pages(
+	struct list_head *page_list, struct list_head *free_pages,
+	struct list_head *ret_pages, struct pglist_data *pgdat,
+	struct scan_control *sc, struct reclaim_stat *stat,
+	uint64_t pf_breakdown[])
+{
+	int nr_reclaimed = 0;
+	LIST_HEAD(rm_mapping_pages);
+	int batch_uncharge_cnt = 0;
+
+	struct lruvec *lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
+	int memcgid = mem_cgroup_id(sc->target_mem_cgroup);
+	while (!list_empty(page_list)) {
+		struct page *page;
+		struct address_space *mapping;
+		int nr_pages;
+
+		page = lru_to_page(page_list);
+		list_del(&page->lru);
+
+		nr_pages = compound_nr(page);
+		if (!trylock_page(page))
+			goto keep;
+		if (PageDirty(page) || PageWriteback(page))
+			goto keep_locked;
+		mapping = page_mapping(page);
+
+		/*
+		 * If the page has buffers, try to free the buffer mappings
+		 * associated with this page. If we succeed we try to free
+		 * the page as well.
+		 *
+		 * We do this even if the page is PageDirty().
+		 * try_to_release_page() does not perform I/O, but it is
+		 * possible for a page to have PageDirty set, but it is actually
+		 * clean (all its buffers are clean).  This happens if the
+		 * buffers were written out directly, with submit_bh(). ext3
+		 * will do this, as well as the blockdev mapping.
+		 * try_to_release_page() will discover that cleanness and will
+		 * drop the buffers and mark the page clean - it can be freed.
+		 *
+		 * Rarely, pages can have buffers and no ->mapping.  These are
+		 * the pages which were not successfully invalidated in
+		 * truncate_cleanup_page().  We try to drop those buffers here
+		 * and if that worked, and the page is no longer mapped into
+		 * process address space (page_count == 1) it can be freed.
+		 * Otherwise, leave the page on the LRU so it is swappable.
+		 */
+
+		if (page_has_private(page)) {
+			if (!try_to_release_page(page, sc->gfp_mask)) {
+				goto activate_locked;
+			}
+			if (!mapping && page_count(page) == 1) {
+				unlock_page(page);
+				if (put_page_testzero(page)) {
+					goto free_it;
+				} else {
+					/*
+					 * rare race with speculative reference.
+					 * the speculative reference will free
+					 * this page shortly, so we may
+					 * increment nr_reclaimed here (and
+					 * leave it off the LRU).
+					 */
+					nr_reclaimed += 1;
+					continue;
+				}
+			}
+		}
+
+		if (PageAnon(page) && !PageSwapBacked(page)) {
+			/* follow __remove_mapping for reference */
+			if (!page_ref_freeze(page, 1)) {
+				goto keep_locked;
+			}
+			if (PageDirty(page)) {
+				page_ref_unfreeze(page, 1);
+				goto keep_locked;
+			}
+
+			count_vm_event(PGLAZYFREED);
+			count_memcg_page_event(page, PGLAZYFREED);
+		
+		} else if (!mapping || !_remove_mapping(mapping, page, true, lruvec,
+					memcgid, &batch_uncharge_cnt)) {
+			goto keep_locked;
+		}
+		unlock_page(page);
+
+free_it:
+		/*
+		 * THP may get swapped out in a whole, need account
+		 * all base pages.
+		 */
+		nr_reclaimed += nr_pages;
+
+		/*
+		 * Is there need to periodically free_page_list? It would
+		 * appear not as the counts should be low
+		 */
+		if (unlikely(PageTransHuge(page)))
+			destroy_compound_page(page);
+		else
+			list_add(&page->lru, free_pages);
+		continue;
+
+activate_locked:
+		/* Not a candidate for swapping, so reclaim swap space. */
+		if (PageSwapCache(page) &&
+		    (mem_cgroup_swap_full(page) || PageMlocked(page)))
+			try_to_free_swap(page);
+		VM_BUG_ON_PAGE(PageActive(page), page);
+		if (!PageMlocked(page)) {
+			int type = page_is_file_lru(page);
+			SetPageActive(page);
+			stat->nr_activate[type] += nr_pages;
+			count_memcg_page_event(page, PGACTIVATE);
+		}
+keep_locked:
+		unlock_page(page);
+keep:
+		list_add(&page->lru, ret_pages);
+		VM_BUG_ON_PAGE(PageLRU(page) || PageUnevictable(page), page);
+	}
+
+	//shengkai : hermit mem cgroup swapout for what?
+	// if (batch_account)
+	// 	hermit_mem_cgroup_swapout(sc->target_mem_cgroup,
+	// 				  batch_uncharge_cnt);
+	while (!list_empty(&rm_mapping_pages)) {
+		struct page *page = lru_to_page(&rm_mapping_pages);
+		list_del(&page->lru);
+		list_add(&page->lru, free_pages);
+	}
+
+	return nr_reclaimed;
+}
+
+
+
+/* [Hermit] batch dirty pages for paging out with a single TLB flush */
+// shengkai : delete bool sthd and forbid sched
+static inline unsigned int
+batched_pageout(struct list_head *page_list, struct list_head *clean_pages,
+		struct list_head *free_pages, struct list_head *ret_pages,
+		struct pglist_data *pgdat, struct scan_control *sc,
+		struct reclaim_stat *stat, uint64_t pf_breakdown[]){
+	int nr_reclaimed = 0;
+	LIST_HEAD(under_write_pages);
+
+	// [Hermit]
+	uint64_t pf_ts;
+	int core = smp_processor_id();
+
+	//batched flush tlb
+		/*
+	 * Page is dirty. Flush the TLB if a writable entry
+	 * potentially exists to avoid CPU writes after IO
+	 * starts and then write it out here.
+	 */
+	if (!list_empty(page_list)) {
+		pf_ts = get_cycles_start();
+		adc_pf_breakdown_stt(pf_breakdown, ADC_TLB_FLUSH_DIRTY, pf_ts);
+		accum_adc_time_stat(ADC_TLB_FLUSH_DIR, -pf_ts);
+		try_to_unmap_flush_dirty();
+		pf_ts = get_cycles_end();
+		adc_pf_breakdown_end(pf_breakdown, ADC_TLB_FLUSH_DIRTY, pf_ts);
+		accum_adc_time_stat(ADC_TLB_FLUSH_DIR, pf_ts);
+		//shengkai : TODO, add new tag of ADC
+	// 	adc_pf_breakdown_stt(pf_breakdown, ADC_BATCHING_OUT, pf_ts);
+	// } else {
+	// 	adc_pf_breakdown_stt(pf_breakdown, ADC_BATCHING_OUT,
+	// 			     pf_cycles_start());
+	}
+
+	while (!list_empty(page_list)) {
+		struct page *page;
+		struct address_space *mapping;
+		int nr_pages;
+
+		page = lru_to_page(page_list);
+		list_del(&page->lru);
+		VM_BUG_ON_PAGE(PageActive(page), page);
+
+		nr_pages = compound_nr(page);
+		if (!trylock_page(page)) {
+			// pr_err("YIFAN: %s:%d", __func__, __LINE__);
+			goto keep;
+		}
+		if (page_mapped(page)) {
+			// pr_err("YIFAN: %s:%d", __func__, __LINE__);
+			goto keep_locked;
+		}
+
+		if (!PageAnon(page) || !PageSwapBacked(page)) {
+			// shengkai: need to add
+			// pr_err("YIFAN: %s:%d", __func__, __LINE__);
+			goto keep_locked;
+		}
+		// shengkai : the main part of batched pageout
+		// deal with dirty page , doing pageout for each page
+		if (PageDirty(page)) {
+			// shengkai : 
+			// no need to repeat this or these bit would be clear?
+			if (page_is_file_lru(page) &&
+			    (!current_is_kswapd() || !PageReclaim(page) ||
+			     !test_bit(PGDAT_DIRTY, &pgdat->flags))) {
+				/*
+				 * Immediately reclaim when written back.
+				 * Similar in principal to deactivate_page()
+				 * except we already have the page isolated
+				 * and know it's dirty
+				 */
+				inc_node_page_state(page, NR_VMSCAN_IMMEDIATE);
+				SetPageReclaim(page);
+
+				goto activate_locked;
+			}
+			// shengkai : for what?
+			mapping = page_mapping(page);
+			if (!mapping) {
+				// pr_err("YIFAN: %s:%d", __func__, __LINE__);
+				goto keep_locked;
+			}
+
+			switch (pageout_profiling(page, mapping, false, core,
+						  pf_breakdown)) {
+			case PAGE_KEEP:
+				// pr_err("YIFAN: %s:%d", __func__, __LINE__);
+				goto keep_locked;
+			case PAGE_ACTIVATE:
+				pr_err("YIFAN: %s:%d", __func__, __LINE__);
+				goto activate_locked;
+			case PAGE_SUCCESS:
+				stat->nr_pageout += thp_nr_pages(page);
+
+				if (PageWriteback(page))
+					goto keep;
+				if (PageDirty(page))
+					goto keep;
+
+				/*
+				 * A synchronous write - probably a ramdisk.  Go
+				 * ahead and try to reclaim the page.
+				 */
+				if (!trylock_page(page)) {
+					VM_BUG_ON_PAGE(
+						PageLRU(page) ||
+							PageUnevictable(page),
+						page);
+					list_add(&page->lru,
+						 &under_write_pages);
+					continue;
+				}
+				if (PageDirty(page) || PageWriteback(page))
+					goto keep_locked;
+				mapping = page_mapping(page);
+				fallthrough;
+			case PAGE_CLEAN:; /* try to free the page below */
+			}
+		}
+
+		unlock_page(page);
+		list_add(&page->lru, clean_pages);
+		continue;
+		// shengkai:
+		// for pages should not out
+activate_locked:
+		/* Not a candidate for swapping, so reclaim swap space. */
+		if (PageSwapCache(page) && (mem_cgroup_swap_full(page) ||
+						PageMlocked(page)))
+			try_to_free_swap(page);
+		VM_BUG_ON_PAGE(PageActive(page), page);
+		if (!PageMlocked(page)) {
+			int type = page_is_file_lru(page);
+			SetPageActive(page);
+			stat->nr_activate[type] += nr_pages;
+			count_memcg_page_event(page, PGACTIVATE);
+		}
+keep_locked:
+		unlock_page(page);
+keep:
+		list_add(&page->lru, ret_pages);
+		VM_BUG_ON_PAGE(PageLRU(page) || PageUnevictable(page), page);
+	}
+	pf_ts = pf_cycles_end();
+	// shengkai : TODO add tag
+	// adc_pf_breakdown_end(pf_breakdown, ADC_BATCHING_OUT, pf_ts);
+
+	adc_pf_breakdown_stt(pf_breakdown, ADC_RLS_PG_RM_MAP, pf_ts);
+	nr_reclaimed += post_pageout_rls_pages(clean_pages, free_pages,
+						      ret_pages, pgdat, sc, stat,
+							  pf_breakdown);
+	pf_ts = pf_cycles_end();
+	adc_pf_breakdown_end(pf_breakdown, ADC_RLS_PG_RM_MAP, pf_ts);
+	if (list_empty(&under_write_pages)) {// not empty means error
+		goto done;
+	}
+	// shengkai : TODO add tag
+	// adc_pf_breakdown_stt(pf_breakdown, ADC_POLL_STORE, pf_ts);
+	if (frontswap_poll_store(core)) { // YIFAN: polling failed
+		// shengkai : TOTO add
+		// pr_err("YIFAN: %s:%d\n", __func__, __LINE__);
+		list_splice_tail(&under_write_pages, ret_pages);
+
+		// adc_pf_breakdown_end(pf_breakdown, ADC_POLL_STORE,
+		// 		     pf_cycles_end());
+		goto done;
+	}
+	pf_ts = pf_cycles_end();
+	// adc_pf_breakdown_end(pf_breakdown, ADC_POLL_STORE, pf_ts);
+	adc_pf_breakdown_stt(pf_breakdown, ADC_RLS_PG_RM_MAP, pf_ts);
+	nr_reclaimed +=
+		post_pageout_rls_pages(&under_write_pages, free_pages,
+					      ret_pages, pgdat, sc, stat,
+					      pf_breakdown);
+	pf_ts = pf_cycles_end();
+	adc_pf_breakdown_end(pf_breakdown, ADC_RLS_PG_RM_MAP, pf_ts);
+
+done:
+	// shengkai : TOTO add
+	// pr_err("YIFAN: nr_reclaimed: %d", nr_reclaimed);
+	// adc_counter_add(nr_reclaimed, ADC_BATCH_RECLAIM);
+	return nr_reclaimed;
+
+}
 
 /*
  * shrink_page_list() returns the number of reclaimed pages
@@ -1306,6 +1645,8 @@ shrink_page_list_profiling(struct list_head *page_list,
 {
 	LIST_HEAD(ret_pages);
 	LIST_HEAD(free_pages);
+	LIST_HEAD(clean_pages);
+	LIST_HEAD(dirty_pages);
 	unsigned int nr_reclaimed = 0;
 	unsigned int pgactivate = 0;
 
@@ -1314,7 +1655,7 @@ shrink_page_list_profiling(struct list_head *page_list,
 	set_adc_pf_bits(adc_pf_bits, ADC_PF_SWAPOUT_BIT);
 
 	memset(stat, 0, sizeof(*stat));
-	cond_resched();
+	// cond_resched();
 
 	while (!list_empty(page_list)) {
 		struct address_space *mapping;
@@ -1323,7 +1664,7 @@ shrink_page_list_profiling(struct list_head *page_list,
 		bool dirty, writeback, may_enter_fs;
 		unsigned int nr_pages;
 
-		cond_resched();
+		// cond_resched();
 
 		page = lru_to_page(page_list);
 		list_del(&page->lru);
@@ -1594,6 +1935,15 @@ shrink_page_list_profiling(struct list_head *page_list,
 			if (!sc->may_writepage)
 				goto keep_locked;
 
+			// [Hermit] batch paging out for anon pages only 
+			// shengkai: 
+			if (PageAnon(page) && PageSwapBacked(page) &&
+			    PageSwapCache(page)) {
+				unlock_page(page);
+				list_add(&page->lru, &dirty_pages);
+				continue;
+			}
+
 			/*
 			 * Page is dirty. Flush the TLB if a writable entry
 			 * potentially exists to avoid CPU writes after IO
@@ -1605,7 +1955,7 @@ shrink_page_list_profiling(struct list_head *page_list,
 			adc_pf_breakdown_end(pf_breakdown, ADC_TLB_FLUSH_DIRTY,
 					     pf_ts);
 			accum_adc_time_stat(ADC_TLB_FLUSH_DIR, pf_ts);
-			switch (pageout_profiling(page, mapping,
+			switch (pageout_profiling(page, mapping, HMT_INV_CORE,
 						  pf_breakdown)) {
 			case PAGE_KEEP:
 				goto keep_locked;
@@ -1633,6 +1983,13 @@ shrink_page_list_profiling(struct list_head *page_list,
 				; /* try to free the page below */
 			}
 		}
+		//shengkai:
+		// batched deal with page lists, passing them to batched pageout
+		// delete behind code until label free it?
+		unlock_page(page);
+		list_add(&page->lru, &clean_pages);
+		continue;
+
 
 		/*
 		 * If the page has buffers, try to free the buffer mappings
@@ -1763,6 +2120,11 @@ keep:
 	}
 
 	pgactivate = stat->nr_activate[0] + stat->nr_activate[1];
+
+	nr_reclaimed +=
+			batched_pageout(&dirty_pages, &clean_pages, &free_pages,
+					&ret_pages, pgdat, sc, stat,
+					pf_breakdown);
 
 	mem_cgroup_uncharge_list(&free_pages);
 	pf_ts = get_cycles_start();

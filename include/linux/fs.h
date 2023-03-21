@@ -416,6 +416,12 @@ struct address_space_operations {
 	int (*swap_activate)(struct swap_info_struct *sis, struct file *file,
 				sector_t *span);
 	void (*swap_deactivate)(struct file *file);
+
+	/* [Hermit] RDMA write on a certain core */
+	int (*writepage_on_core)(struct page *page,
+				 struct writeback_control *wbc, int core);
+	int (*poll_write)(int core);
+	/* [Hermit] end */
 };
 
 extern const struct address_space_operations empty_aops;
