@@ -943,7 +943,7 @@ static struct page *swap_vma_readahead_profiling(swp_entry_t fentry,
 		entry = pte_to_swp_entry(pentry);
 		if (unlikely(non_swap_entry(entry)))
 			continue;
-		vaddr = faddr + ((unsigned long)i - (unsigned long)ra_info->offset) * PAGE_SIZE;
+		vaddr = faddr + ((unsigned long)i - (unsigned long)ra_info.offset) * PAGE_SIZE;
 		page = __read_swap_cache_async_profiling(entry, gfp_mask, vma,
 					       vmf->address, &page_allocated,
 					       adc_pf_bits, pf_breakdown);
@@ -1012,6 +1012,135 @@ struct page *swapin_readahead_profiling(swp_entry_t entry, gfp_t gfp_mask,
 						    adc_pf_bits, pf_breakdown, cpu) :
 			     swap_cluster_readahead_profiling(
 			       entry, gfp_mask, vmf, adc_pf_bits, pf_breakdown, cpu);
+}
+
+
+/* shengkai:
+ * swapin_bypass_swapcache - swap in demand page when its swapcount == 1
+ * and bypass the swap cache. Prefetch enabled in this function as well.
+ *
+ * @pagep: the pointer to the struct page for later post processing
+ * Return 0 when succeed or VM_FAULT_OOM when failed
+ */
+vm_fault_t swapin_bypass_swapcache(struct page **pagep,
+							struct vm_fault *vmf,
+							swp_entry_t entry,
+							int *cpu,
+							int *adc_pf_bits,
+							uint64_t pf_breakdown[])
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct page *page;
+	*cpu = -1;
+	// [RMGrid] for frontswap polling
+	void *shadow = NULL;
+
+	// shengkai: 
+	// prefetch params
+	//does it need plug(mark a batch of submitted i/o?)
+	u64 faddr = vmf->address;
+	u64 vaddr = faddr;
+	pte_t *pte, pentry;
+	bool page_allocated;
+	gfp_t gfp_mask = GFP_HIGHUSER_MOVABLE;
+	uint64_t pf_ts = 0;
+	int fcpu = -1;
+	int nr_prefed = 0;
+	struct vma_swap_readahead ra_info_data = {
+		.win = 1,
+	};
+	struct vma_swap_readahead *ra_info = &ra_info_data;
+	// shengkai:
+	// need lock or not?
+	*pagep = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, vmf->address);
+	page = *pagep;
+
+	if (!page) {
+		// adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO,
+		// 		     pf_cycles_end());
+		goto oom;
+	}
+
+	__SetPageLocked(page);
+	__SetPageSwapBacked(page);
+	if (mem_cgroup_swapin_charge_page_profiling(
+		page, vma->vm_mm, GFP_KERNEL, entry,adc_pf_bits, pf_breakdown)) {
+		goto oom;
+	}
+
+	mem_cgroup_swapin_uncharge_swap(entry);
+
+	shadow = get_shadow_from_swap_cache(entry);
+	if (shadow)
+		workingset_refault(page, shadow);
+
+	*cpu = get_cpu();
+
+	/* To provide entry to swap_readpage() */
+	set_page_private(page, entry.val);
+	swap_readpage(page, true);
+	set_page_private(page, 0);
+	// frontswap_poll_load(cpu); do poll later
+	put_cpu();
+
+	// [RMGrid] profiling
+	set_adc_pf_bits(adc_pf_bits, ADC_PF_MAJOR_BIT);
+	adc_profile_counter_inc(ADC_ONDEMAND_SWAPIN);
+	// count_memcg_event_mm(vma->vm_mm,ONDEMAND_SWAPIN);
+
+	// for prefetching
+	swap_ra_info(vmf, ra_info);
+	adc_pf_breakdown_stt(pf_breakdown, ADC_PREFETCH, get_cycles_start());
+
+	if(ra_info->win == 1)
+		goto done;
+
+	fcpu = *cpu;
+	for (int i = 0, pte = &ra_info->ptes[i]; i < ra_info->nr_pte;
+	     i++, pte++) {
+		//end prefetch when load sync done
+		if (fcpu != -1 && frontswap_peek_load(fcpu) == 0)
+			break;
+		if (i == ra_info->offset)
+			continue;
+		pentry = *pte;
+		if (pte_none(pentry))
+			continue;
+		if (pte_present(pentry))
+			continue;
+		entry = pte_to_swp_entry(pentry);
+		if (unlikely(non_swap_entry(entry)))
+			continue;
+		vaddr = faddr + ((unsigned long)i - (unsigned long)ra_info->offset) * PAGE_SIZE;
+		// pf_ts = get_cycles_start();
+		// adc_pf_breakdown_stt(pf_breakdown, ADC_RD_CACHE_ASYNC, pf_ts);
+		page = __read_swap_cache_async_profiling(
+			entry, GFP_HIGHUSER_MOVABLE, vma, faddr,
+			&page_allocated, adc_pf_bits, pf_breakdown);
+		// pf_ts = get_cycles_end();
+		// adc_pf_breakdown_end(pf_breakdown, ADC_RD_CACHE_ASYNC, pf_ts);
+		if (!page)
+    		continue;
+		if (page_allocated) {
+			swap_readpage_async(page, vaddr, vma, pte, pentry);
+			SetPageReadahead(page);
+			count_vm_event(SWAP_RA);
+			set_page_prefetch(page);
+			// [RMGrid] profiling
+			adc_profile_counter_inc(ADC_PREFETCH_SWAPIN);
+			nr_prefed++;
+		}
+		put_page(page);
+	}
+
+done:
+	adc_pf_breakdown_end(pf_breakdown, ADC_PREFETCH, pf_cycles_end());
+	lru_cache_add(page);
+	return 0;
+oom:
+	//lazy poll can't get specific io time
+	// adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO, pf_cycles_end());
+	return VM_FAULT_OOM;
 }
 
 #ifdef CONFIG_SYSFS

@@ -1479,7 +1479,7 @@ batched_pageout(struct list_head *page_list, struct list_head *clean_pages,
 	// 	adc_pf_breakdown_stt(pf_breakdown, ADC_BATCHING_OUT, pf_ts);
 	// } else {
 	// 	adc_pf_breakdown_stt(pf_breakdown, ADC_BATCHING_OUT,
-	// 			     pf_cycles_start());
+	// 			     get_cycles_start());
 	}
 
 	while (!list_empty(page_list)) {

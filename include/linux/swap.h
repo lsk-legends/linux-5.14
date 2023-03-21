@@ -484,6 +484,13 @@ extern struct page *swapin_readahead_profiling(swp_entry_t entry, gfp_t flag,
 					       struct vm_fault *vmf,
 					       int *adc_pf_bits,
 					       uint64_t pf_breakdown[], int *cpu);
+// shengkai :
+extern vm_fault_t swapin_bypass_swapcache(struct page **pagep,
+							struct vm_fault *vmf,
+							swp_entry_t entry,
+							int *cpu,
+							int *adc_pf_bits,
+							uint64_t pf_breakdown[]);
 
 /* linux/mm/swapfile.c */
 extern atomic_long_t nr_swap_pages;
@@ -637,6 +644,16 @@ static inline struct page *swapin_readahead_profiling(swp_entry_t swp,
 						      uint64_t pf_breakdown[], int *cpu)
 {
 	return NULL;
+}
+// shengkai : 
+static inline vm_fault_t swapin_bypass_swapcache(struct page **pagep,
+							struct vm_fault *vmf,
+							swp_entry_t entry,
+							int *cpu,
+							int *adc_pf_bits,
+							uint64_t pf_breakdown[])
+{
+	return 0;
 }
 
 static inline int swap_writepage(struct page *p, struct writeback_control *wbc)
